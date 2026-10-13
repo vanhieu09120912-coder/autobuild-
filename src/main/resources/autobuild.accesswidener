@@ -1,0 +1,2 @@
+accessWidener v2 named
+accessible method net/minecraft/world/item/BlockItem getPlacementState (Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;
