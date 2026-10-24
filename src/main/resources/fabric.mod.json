@@ -8,7 +8,7 @@
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
-    "client": ["cái.cũ", "autosand.AutoSandOrders"]
+    "client": ["dev.autobuild.AutoBuildClient", "autosand.AutoSandOrders"]
   },
   "accessWidener": "autobuild.accesswidener",
   "depends": {
