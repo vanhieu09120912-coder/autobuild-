@@ -23,6 +23,7 @@ import net.minecraft.world.item.Items;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.text.Normalizer;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.function.Predicate;
@@ -32,6 +33,7 @@ import java.util.function.Predicate;
  *
  * 1) Đào cát (Baritone / giữ phím / chỉ Nuker) -> đầy túi -> /orders -> giao cát vào đơn đầu tiên -> xác nhận
  *    -> thoát các bảng server mở lại (thêm FINISH_CLOSES lần) -> đào tiếp.
+ *    Đơn đầu không nhận cát (đầy, không mở được bảng giao...) -> mở lại /orders thử các đơn cát kế tiếp.
  * 2) Xẻng gần hư -> bình XP vào ô 2 thanh công cụ, xẻng vào tay trái, tay phải ném bình -> xẻng về lại.
  * 3) Hết bình XP -> vứt cát đang nằm trên thanh công cụ -> /shop -> ô totem -> bình XP -> đặt 64 -> xác nhận,
  *    lặp lại cho tới khi thanh công cụ đầy bình XP.
@@ -56,6 +58,9 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static final int FINISH_CLOSES = 2;     // sau khi giao cát xong, thoát bảng (ESC) ít nhất bấy nhiêu lần
     static final int BUY_MAX_ROUNDS = 9;    // tối đa số lần mua (mỗi lần 64 bình) khi lấp đầy thanh công cụ
+    static final int BUY_RETRIES = 2;       // bảng mua bị đóng / quá hạn -> mở lại /shop thử lại tối đa bấy nhiêu lần
+    static final int ORDER_MAX_TRIES = 15;  // đơn không nhận cát -> thử đơn cát kế tiếp, tối đa bấy nhiêu đơn
+    static final int ORDER_OPEN_TIMEOUT = 60; // tick chờ bảng giao hàng mở ra sau khi bấm vào đơn (60 = 3 giây)
 
     static final int CONFIRM_SLOT = 16;     // màn xác nhận giao cát (dự phòng nếu không tìm thấy theo tên)
     static final int BOTTLE_SLOT = 1;       // ô số 2 trên thanh công cụ (đếm từ 0)
@@ -100,6 +105,9 @@ public class AutoSandOrders implements ClientModInitializer {
     static int step = 0, shovelFrom = -1, mendThrows = 0, lastCheck = 0, lastDamage = 0, buyTries = 0;
     static int closes = 0, finishIdle = 0;                       // thoát bảng sau khi giao cát
     static int buyRound = 0, buyTarget = 1, buyBefore = 0, dropStep = 0; // mua đầy thanh công cụ
+    static int buyRetry = 0, gone = 0;                           // thử lại khi bảng mua bị đóng
+    static int orderTry = 0, orderSlot = -1, ordersWait = 0, sandBefore = 0; // thử lần lượt các đơn cát
+    static boolean settle = false;
     static boolean shovelSwapped = false, needBuy = false;
     static float oldXRot = Float.NaN, dropXRot = Float.NaN;
 
@@ -256,6 +264,17 @@ public class AutoSandOrders implements ClientModInitializer {
                 finishBuy(mc, p);
                 return;
             }
+            // Bấm vào đơn mà không mở được bảng giao hàng -> thử đơn kế tiếp
+            if (state == S.WAIT_DELIVER) {
+                nextOrder(mc, p, "bấm vào mà không mở được bảng giao hàng");
+                return;
+            }
+            boolean buying = state == S.BUY_SHOP || state == S.BUY_GEAR || state == S.BUY_AMOUNT
+                || state == S.BUY_CONFIRM || state == S.BUY_DONE;
+            if (buying && buyRetry < BUY_RETRIES) {
+                retryBuy(mc, p, "hết thời gian chờ ở bước " + state);
+                return;
+            }
             abort(mc, "hết thời gian chờ ở bước " + state);
             return;
         }
@@ -266,36 +285,67 @@ public class AutoSandOrders implements ClientModInitializer {
 
             // ================= GIAO CÁT VÀO ORDERS =================
             case WAIT_ORDERS -> {
-                if (h == null || h.getRowCount() != 6) return;
-                ItemStack first = h.slots.get(0).getItem();
-                if (first.isEmpty()) return;
-                if (!first.is(Items.SAND)) { abort(mc, "ô đầu tiên không phải đơn cát"); return; }
-                click(mc, p, h, 0, ClickType.PICKUP);
+                if (h == null || h.getRowCount() != 6 || !loaded(h)) return;
+                // Chọn đơn cát thứ orderTry trong bảng (0 = đơn đầu tiên). Đơn nào không nhận cát
+                // thì nextOrder() mở lại /orders và tăng orderTry để thử đơn kế tiếp.
+                int pick = -1, seen = 0;
+                int n = h.getRowCount() * 9;
+                for (int i = 0; i < n && i < h.slots.size(); i++) {
+                    if (h.slots.get(i).getItem().is(Items.SAND)) {
+                        if (seen == orderTry) { pick = i; break; }
+                        seen++;
+                    }
+                }
+                if (pick < 0) {
+                    if (++ordersWait < 10) return;   // chờ server điền nốt các ô đơn hàng
+                    abort(mc, "không còn đơn cát nào để thử (đã thử " + orderTry + " đơn)");
+                    return;
+                }
+                orderSlot = pick;
+                click(mc, p, h, pick, ClickType.PICKUP);
                 lastSync = h.containerId;
                 state = S.WAIT_DELIVER;
-                timeout = STEP_TIMEOUT;
+                timeout = ORDER_OPEN_TIMEOUT;        // không mở được bảng giao -> thử đơn kế tiếp
                 wait = ACTION_DELAY;
             }
             case WAIT_DELIVER -> {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 6) return;
                 lastSync = h.containerId;
+                sandBefore = countItem(p, Items.SAND);   // để biết đơn có nhận cát không
+                clicks = 0;
+                settle = false;
                 state = S.DEPOSIT;
                 timeout = STEP_TIMEOUT;
                 wait = ACTION_DELAY;
             }
             case DEPOSIT -> {
-                if (h == null || h.containerId != lastSync) { abort(mc, "mất GUI giao hàng"); return; }
+                if (h == null || h.containerId != lastSync) {
+                    // bảng giao hàng biến mất: đã giao được cát thì sang bước xác nhận, chưa thì thử đơn khác
+                    if (sandMoved(p)) {
+                        state = S.WAIT_CONFIRM;
+                        timeout = STEP_TIMEOUT;
+                        wait = ACTION_DELAY;
+                    } else {
+                        nextOrder(mc, p, "đơn đóng bảng mà không nhận cát");
+                    }
+                    return;
+                }
+                if (settle) {                        // đã bấm thử 1 lần và chờ server trả lời
+                    settle = false;
+                    if (!sandMoved(p)) { nextOrder(mc, p, "đơn không nhận cát (đầy?)"); return; }
+                }
                 if (clicks < 120) {
                     for (int i = 0; i < h.slots.size(); i++) {
                         Slot s = h.slots.get(i);
                         if (s.container == p.getInventory() && s.getItem().is(Items.SAND)) {
                             click(mc, p, h, i, ClickType.QUICK_MOVE);
                             clicks++;
-                            wait = 1;
+                            if (clicks == 1) { settle = true; wait = 6; } else wait = 1;
                             return;
                         }
                     }
                 }
+                if (clicks == 0) { abort(mc, "không có cát để giao"); return; }
                 p.closeContainer();
                 state = S.WAIT_CONFIRM;
                 timeout = STEP_TIMEOUT;
@@ -303,7 +353,7 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             case WAIT_CONFIRM -> {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 3) return;
-                int slot = find(h, st -> nameHas(st, "xác nhận", "xac nhan"), -1);
+                int slot = find(h, st -> nameHas(st, "xác nhận", "confirm"), -1);
                 if (slot < 0) slot = CONFIRM_SLOT;
                 click(mc, p, h, slot, ClickType.PICKUP);
                 state = S.FINISH;
@@ -480,17 +530,31 @@ public class AutoSandOrders implements ClientModInitializer {
             case BUY_AMOUNT -> {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 3 || !loaded(h)) return;
                 int i = find(h, st -> nameHas(st, "64"), 13);
-                if (i < 0) i = BUY_SET64_SLOT;
+                if (i < 0) {
+                    i = BUY_SET64_SLOT;
+                    msg(p, "Không thấy nút 64 theo tên, bấm ô " + i + ". Các ô: " + dump(h));
+                }
                 click(mc, p, h, i, ClickType.PICKUP);
                 lastSync = h.containerId;
+                gone = 0;
                 state = S.BUY_CONFIRM;
                 timeout = STEP_TIMEOUT;
                 wait = ACTION_DELAY * 2;
             }
             case BUY_CONFIRM -> {
-                if (h == null || h.containerId != lastSync) { abort(mc, "mất GUI mua hàng"); return; }
-                int i = find(h, st -> nameHas(st, "xác nhận", "xac nhan"), -1);
-                if (i < 0) i = BUY_CONFIRM_SLOT;
+                // Sau khi bấm "64", server có thể giữ nguyên bảng hoặc mở bảng mới -> bấm xác nhận ở bảng hiện tại.
+                if (h == null || h.getRowCount() != 3) {
+                    // bảng bị đóng / đang đổi: chờ ~1 giây, không thấy lại thì mở lại shop mua lại
+                    if (++gone > 20) retryBuy(mc, p, "bảng mua bị đóng trước khi xác nhận");
+                    return;
+                }
+                if (!loaded(h)) return;                      // bảng mới chưa nhận đủ đồ
+                gone = 0;
+                int i = find(h, st -> nameHas(st, "xác nhận", "confirm"), -1);
+                if (i < 0) {
+                    i = BUY_CONFIRM_SLOT;
+                    msg(p, "Không thấy nút xác nhận theo tên, bấm ô " + i + ". Các ô: " + dump(h));
+                }
                 buyBefore = countItem(p, Items.EXPERIENCE_BOTTLE); // để biết hàng về chưa
                 click(mc, p, h, i, ClickType.PICKUP);
                 state = S.BUY_DONE;
@@ -502,6 +566,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (countItem(p, Items.EXPERIENCE_BOTTLE) <= buyBefore) return;
                 if (mc.screen != null) { p.closeContainer(); wait = 3; return; }
                 buyRound++;
+                buyRetry = 0;
                 if (buyRound < buyTarget) {
                     // thanh công cụ chưa đầy -> mua thêm 1 stack nữa
                     send(p, "/" + SHOP_COMMAND);
@@ -524,7 +589,34 @@ public class AutoSandOrders implements ClientModInitializer {
         state = S.WAIT_ORDERS;
         timeout = STEP_TIMEOUT;
         clicks = 0;
+        orderTry = 0;
+        ordersWait = 0;
+        settle = false;
         wait = ACTION_DELAY;
+    }
+
+    /** Đơn vừa thử không nhận cát -> đóng bảng, mở lại /orders và thử đơn cát kế tiếp. */
+    static void nextOrder(Minecraft mc, LocalPlayer p, String why) {
+        int tried = orderTry + 1;
+        orderTry++;
+        if (orderTry >= ORDER_MAX_TRIES) {
+            abort(mc, "đã thử " + tried + " đơn mà không đơn nào nhận cát");
+            return;
+        }
+        msg(p, "Đơn ở ô " + orderSlot + ": " + why + ". Thử đơn kế tiếp (" + (orderTry + 1) + "/" + ORDER_MAX_TRIES + ").");
+        if (mc.screen != null) p.closeContainer();
+        send(p, "/" + ORDER_COMMAND);
+        state = S.WAIT_ORDERS;
+        timeout = STEP_TIMEOUT;
+        clicks = 0;
+        ordersWait = 0;
+        settle = false;
+        wait = ACTION_DELAY * 3;
+    }
+
+    /** Số cát trong túi đã giảm so với lúc bắt đầu giao = đơn có nhận cát. */
+    static boolean sandMoved(LocalPlayer p) {
+        return countItem(p, Items.SAND) < sandBefore;
     }
 
     static void startMend(Minecraft mc, LocalPlayer p) {
@@ -551,9 +643,22 @@ public class AutoSandOrders implements ClientModInitializer {
     static void beginBuy() {
         dropStep = 0;
         buyRound = 0;
+        buyRetry = 0;
         state = S.BUY_PREP;
         timeout = STEP_TIMEOUT;
         wait = ACTION_DELAY;
+    }
+
+    /** Bảng mua bị đóng / quá hạn giữa chừng -> đóng hết, mở lại /shop và mua lại lượt hiện tại. */
+    static void retryBuy(Minecraft mc, LocalPlayer p, String why) {
+        buyRetry++;
+        msg(p, "Mua chưa xong (" + why + "), thử lại lần " + buyRetry + "/" + BUY_RETRIES + ".");
+        if (mc.screen != null) p.closeContainer();
+        send(p, "/" + SHOP_COMMAND);
+        state = S.BUY_SHOP;
+        gone = 0;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY * 3;
     }
 
     /** Mua xong -> quay lại sửa xẻng. */
@@ -711,13 +816,41 @@ public class AutoSandOrders implements ClientModInitializer {
         return -1;
     }
 
+    /** a-z kiểu small-caps (ᴀʙᴄ...) theo đúng thứ tự a..z, để so tên nút server viết bằng chữ small-caps. */
+    static final String SMALL_CAPS =
+        "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍ"
+        + "ɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ";
+
+    /** Chuẩn hoá tên để so sánh: chữ thường, bỏ dấu tiếng Việt, đổi small-caps về a-z. */
+    static String norm(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            int k = SMALL_CAPS.indexOf(c);
+            sb.append(k >= 0 ? (char) ('a' + k) : c);
+        }
+        String t = Normalizer.normalize(sb.toString().toLowerCase(Locale.ROOT), Normalizer.Form.NFD);
+        return t.replaceAll("\\p{M}+", "").replace('đ', 'd');
+    }
+
     static boolean nameHas(ItemStack st, String... keys) {
         if (st.isEmpty()) return false;
-        String n = st.getHoverName().getString().toLowerCase(Locale.ROOT);
+        String n = norm(st.getHoverName().getString());
         for (String k : keys) {
-            if (n.contains(k)) return true;
+            if (n.contains(norm(k))) return true;
         }
         return false;
+    }
+
+    /** Liệt kê "ô=tên" của các ô có đồ trong phần chest, dùng để báo lỗi khi không tìm thấy nút theo tên. */
+    static String dump(ChestMenu h) {
+        StringBuilder sb = new StringBuilder();
+        int n = h.getRowCount() * 9;
+        for (int i = 0; i < n && i < h.slots.size(); i++) {
+            ItemStack st = h.slots.get(i).getItem();
+            if (!st.isEmpty()) sb.append(i).append('=').append(st.getHoverName().getString()).append(" | ");
+        }
+        return sb.toString();
     }
 
     // ----------------------------- HÀM PHỤ: CHAT -----------------------------
