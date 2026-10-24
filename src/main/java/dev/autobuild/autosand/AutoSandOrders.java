@@ -322,6 +322,8 @@ public class AutoSandOrders implements ClientModInitializer {
                 return;
             }
         }
+        // Chốt chặn thứ 2, lệch pha với chốt trên: bypass 1 chỗ vẫn bị chặn ở chỗ còn lại.
+        if (!License.quickCheck()) { setEnabled(mc, false); return; }
 
         if (state == S.MINING) {
             if (mc.screen != null) return;
@@ -420,6 +422,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 wait = ACTION_DELAY;
             }
             case DEPOSIT -> {
+                if (!License.quickCheck()) { abort(mc, "key không hợp lệ"); return; }
                 if (h == null || h.containerId != lastSync) {
                     // bảng giao hàng biến mất: đã giao được cát thì sang bước xác nhận, chưa thì thử đơn khác
                     if (sandMoved(p)) {
@@ -1195,12 +1198,20 @@ public class AutoSandOrders implements ClientModInitializer {
     static final class License {
         private License() { }
 
-        public static final String ZALO = "0397657250";
+        private static final byte[] ZALO_ENC = {85, 86, 92, 82, 83, 80, 82, 87, 80, 85}; // XOR("0397657250", 0x65)
+        public static final String ZALO = deobf(ZALO_ENC);
 
         /** Dán public key (do `java KeyGen.java genpair` in ra) vào đây. */
         private static final String PUBLIC_KEY_B64 = "PASTE_PUBLIC_KEY_HERE";
 
-        private static final byte[] DOMAIN = "AutoSand/key/v1".getBytes(StandardCharsets.UTF_8);
+        private static final byte[] DOMAIN_ENC = {36, 16, 17, 10, 54, 4, 11, 1, 74, 14, 0, 28, 74, 19, 84}; // XOR("AutoSand/key/v1", 0x65)
+        private static final byte[] DOMAIN = deobf(DOMAIN_ENC).getBytes(StandardCharsets.UTF_8);
+
+        private static String deobf(byte[] enc) {
+            char[] c = new char[enc.length];
+            for (int i = 0; i < enc.length; i++) c[i] = (char) (enc[i] ^ 0x65);
+            return new String(c);
+        }
         private static final int PAYLOAD_LEN = 22;   // ver(1) type(1) issued(4) expires(4) hwid(8) id(4)
         private static final int SIG_LEN = 64;
         private static final String[] TYPE_NAME = {"?", "Ngày", "Tuần", "Tháng"};
