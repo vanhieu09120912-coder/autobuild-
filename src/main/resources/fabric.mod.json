@@ -8,14 +8,13 @@
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
-    "client": ["dev.autobuild.AutoBuildClient", "autosand.AutoSandOrders"]
+    "client": ["autosand.AutoSandOrders"]
   },
   "accessWidener": "autobuild.accesswidener",
   "depends": {
-    "fabricloader": ">=0.18.1",
-    "minecraft": "~1.21.11",
-    "java": ">=21",
-    "fabric-api": "*",
-    "litematica": "*"
+  "fabricloader": ">=0.18.1",
+  "minecraft": "~1.21.11",
+  "java": ">=21",
+  "fabric-api": "*"
   }
 }
