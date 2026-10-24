@@ -30,9 +30,11 @@ import java.util.function.Predicate;
 /**
  * AutoSandOrders (Fabric 1.21.11, Mojang mappings)
  *
- * 1) Đào cát (Baritone / giữ phím / chỉ Nuker) -> đầy túi -> /orders -> giao cát vào đơn đầu tiên -> xác nhận.
+ * 1) Đào cát (Baritone / giữ phím / chỉ Nuker) -> đầy túi -> /orders -> giao cát vào đơn đầu tiên -> xác nhận
+ *    -> thoát các bảng server mở lại (thêm FINISH_CLOSES lần) -> đào tiếp.
  * 2) Xẻng gần hư -> bình XP vào ô 2 thanh công cụ, xẻng vào tay trái, tay phải ném bình -> xẻng về lại.
- * 3) Hết bình XP -> /shop -> ô totem -> bình XP -> đặt 64 -> xác nhận.
+ * 3) Hết bình XP -> vứt cát đang nằm trên thanh công cụ -> /shop -> ô totem -> bình XP -> đặt 64 -> xác nhận,
+ *    lặp lại cho tới khi thanh công cụ đầy bình XP.
  *
  * Lệnh:  /autosand            mở bảng GUI tuỳ chỉnh
  *        /autosand toggle     bật / tắt nhanh
@@ -51,6 +53,9 @@ public class AutoSandOrders implements ClientModInitializer {
     static final int THROW_DELAY = 3;       // tick giữa mỗi lần ném bình XP
     static final int STEP_TIMEOUT = 200;    // quá số tick này mà 1 bước chưa xong -> huỷ
     static final int COOLDOWN_AFTER = 60;
+
+    static final int FINISH_CLOSES = 2;     // sau khi giao cát xong, thoát bảng (ESC) ít nhất bấy nhiêu lần
+    static final int BUY_MAX_ROUNDS = 9;    // tối đa số lần mua (mỗi lần 64 bình) khi lấp đầy thanh công cụ
 
     static final int CONFIRM_SLOT = 16;     // màn xác nhận giao cát (dự phòng nếu không tìm thấy theo tên)
     static final int BOTTLE_SLOT = 1;       // ô số 2 trên thanh công cụ (đếm từ 0)
@@ -85,7 +90,7 @@ public class AutoSandOrders implements ClientModInitializer {
     enum S {
         MINING, WAIT_ORDERS, WAIT_DELIVER, DEPOSIT, WAIT_CONFIRM, FINISH,
         MEND_PREP, MEND_THROW, MEND_RESTORE,
-        BUY_SHOP, BUY_GEAR, BUY_AMOUNT, BUY_CONFIRM, BUY_DONE
+        BUY_PREP, BUY_SHOP, BUY_GEAR, BUY_AMOUNT, BUY_CONFIRM, BUY_DONE
     }
 
     static S state = S.MINING;
@@ -93,8 +98,10 @@ public class AutoSandOrders implements ClientModInitializer {
     static boolean openGui = false;
     static int wait = 0, timeout = 0, cooldown = 0, lastSync = -1, clicks = 0;
     static int step = 0, shovelFrom = -1, mendThrows = 0, lastCheck = 0, lastDamage = 0, buyTries = 0;
+    static int closes = 0, finishIdle = 0;                       // thoát bảng sau khi giao cát
+    static int buyRound = 0, buyTarget = 1, buyBefore = 0, dropStep = 0; // mua đầy thanh công cụ
     static boolean shovelSwapped = false, needBuy = false;
-    static float oldXRot = Float.NaN;
+    static float oldXRot = Float.NaN, dropXRot = Float.NaN;
 
     // ----------------------------- KHỞI TẠO -----------------------------
     @Override
@@ -243,7 +250,15 @@ public class AutoSandOrders implements ClientModInitializer {
         }
 
         if (wait > 0) { wait--; return; }
-        if (--timeout <= 0) { abort(mc, "hết thời gian chờ ở bước " + state); return; }
+        if (--timeout <= 0) {
+            // Mua dở nhưng đã có bình XP (vd. hết tiền ở lần mua sau) -> cứ dùng số bình đang có
+            if (state == S.BUY_DONE && countItem(p, Items.EXPERIENCE_BOTTLE) > 0) {
+                finishBuy(mc, p);
+                return;
+            }
+            abort(mc, "hết thời gian chờ ở bước " + state);
+            return;
+        }
 
         ChestMenu h = container(mc);
 
@@ -292,10 +307,27 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (slot < 0) slot = CONFIRM_SLOT;
                 click(mc, p, h, slot, ClickType.PICKUP);
                 state = S.FINISH;
+                closes = 0;
+                finishIdle = 0;
+                timeout = STEP_TIMEOUT;
                 wait = ACTION_DELAY * 3;
             }
             case FINISH -> {
-                if (mc.screen != null) p.closeContainer();
+                // Sau khi xác nhận, server mở lại các bảng đơn hàng -> thoát (ESC) từng bảng,
+                // ít nhất FINISH_CLOSES lần, rồi mới đào tiếp.
+                if (mc.screen != null) {
+                    p.closeContainer();
+                    closes++;
+                    finishIdle = 0;
+                    wait = ACTION_DELAY;   // chờ server mở bảng kế tiếp (nếu có)
+                    return;
+                }
+                int idleMax = closes < FINISH_CLOSES ? 8 : 2;
+                if (finishIdle < idleMax) {
+                    finishIdle++;
+                    wait = 3;
+                    return;
+                }
                 startMining(p);
                 state = S.MINING;
                 cooldown = COOLDOWN_AFTER;
@@ -386,17 +418,45 @@ public class AutoSandOrders implements ClientModInitializer {
                     needBuy = false;
                     if (autoBuy && buyTries < 2 && lowShovel(p) >= 0) {
                         buyTries++;
-                        send(p, "/" + SHOP_COMMAND);
-                        state = S.BUY_SHOP;
-                        timeout = STEP_TIMEOUT;
-                        wait = ACTION_DELAY;
+                        beginBuy();
                         return;
                     }
                 }
                 finishMend(mc, p);
             }
 
-            // ================= MUA BÌNH XP =================
+            // ================= MUA BÌNH XP (ĐẦY THANH CÔNG CỤ) =================
+            case BUY_PREP -> {
+                if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
+                int sand = hotbarSandSlot(p);
+
+                if (dropStep == 0) {
+                    if (sand < 0) { dropStep = 2; return; }   // thanh công cụ không có cát
+                    dropXRot = p.getXRot();
+                    p.setXRot(0f);                             // nhìn ngang để cát văng xa, không bị nhặt lại
+                    dropStep = 1;
+                    wait = 3;                                  // chờ server nhận hướng nhìn mới
+                    return;
+                }
+                if (dropStep == 1) {
+                    if (sand >= 0) {
+                        dropStack(mc, p, sand);                // vứt cả stack cát ra ngoài
+                        wait = 2;
+                        return;
+                    }
+                    if (!Float.isNaN(dropXRot)) { p.setXRot(dropXRot); dropXRot = Float.NaN; }
+                    dropStep = 2;
+                    wait = ACTION_DELAY;
+                    return;
+                }
+                // dropStep == 2: thanh công cụ đã sạch cát -> tính số lần mua rồi mở shop
+                buyRound = 0;
+                buyTarget = Math.max(1, Math.min(BUY_MAX_ROUNDS, (hotbarMissing(p) + 63) / 64));
+                send(p, "/" + SHOP_COMMAND);
+                state = S.BUY_SHOP;
+                timeout = STEP_TIMEOUT;
+                wait = ACTION_DELAY;
+            }
             case BUY_SHOP -> {
                 if (h == null || h.getRowCount() != 3 || !loaded(h)) return;
                 int i = find(h, st -> st.is(Items.TOTEM_OF_UNDYING), -1);
@@ -431,18 +491,26 @@ public class AutoSandOrders implements ClientModInitializer {
                 if (h == null || h.containerId != lastSync) { abort(mc, "mất GUI mua hàng"); return; }
                 int i = find(h, st -> nameHas(st, "xác nhận", "xac nhan"), -1);
                 if (i < 0) i = BUY_CONFIRM_SLOT;
+                buyBefore = countItem(p, Items.EXPERIENCE_BOTTLE); // để biết hàng về chưa
                 click(mc, p, h, i, ClickType.PICKUP);
                 state = S.BUY_DONE;
                 timeout = 80;
                 wait = ACTION_DELAY * 3;
             }
             case BUY_DONE -> {
-                if (countItem(p, Items.EXPERIENCE_BOTTLE) <= 0) return; // chờ hàng về, quá hạn sẽ huỷ
+                // chờ hàng về (quá hạn thì xử lý ở phần timeout phía trên)
+                if (countItem(p, Items.EXPERIENCE_BOTTLE) <= buyBefore) return;
                 if (mc.screen != null) { p.closeContainer(); wait = 3; return; }
-                state = S.MEND_PREP;
-                step = 0;
-                timeout = STEP_TIMEOUT;
-                wait = ACTION_DELAY;
+                buyRound++;
+                if (buyRound < buyTarget) {
+                    // thanh công cụ chưa đầy -> mua thêm 1 stack nữa
+                    send(p, "/" + SHOP_COMMAND);
+                    state = S.BUY_SHOP;
+                    timeout = STEP_TIMEOUT;
+                    wait = ACTION_DELAY;
+                    return;
+                }
+                finishBuy(mc, p);
             }
 
             default -> { }
@@ -472,12 +540,30 @@ public class AutoSandOrders implements ClientModInitializer {
         timeout = STEP_TIMEOUT;
         wait = ACTION_DELAY;
         if (countItem(p, Items.EXPERIENCE_BOTTLE) == 0) {
-            send(p, "/" + SHOP_COMMAND);
             buyTries = 1;
-            state = S.BUY_SHOP;
+            beginBuy();
         } else {
             state = S.MEND_PREP;
         }
+    }
+
+    /** Vào quy trình mua: vứt cát trên thanh công cụ -> /shop -> mua tới khi đầy thanh công cụ. */
+    static void beginBuy() {
+        dropStep = 0;
+        buyRound = 0;
+        state = S.BUY_PREP;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
+    }
+
+    /** Mua xong -> quay lại sửa xẻng. */
+    static void finishBuy(Minecraft mc, LocalPlayer p) {
+        if (mc.screen != null) p.closeContainer();
+        msg(p, "Đã mua bình XP, hiện có " + countItem(p, Items.EXPERIENCE_BOTTLE) + " bình.");
+        state = S.MEND_PREP;
+        step = 0;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
     }
 
     static void finishMend(Minecraft mc, LocalPlayer p) {
@@ -500,6 +586,7 @@ public class AutoSandOrders implements ClientModInitializer {
                 shovelSwapped = false;
             }
             if (!Float.isNaN(oldXRot)) { p.setXRot(oldXRot); oldXRot = Float.NaN; }
+            if (!Float.isNaN(dropXRot)) { p.setXRot(dropXRot); dropXRot = Float.NaN; }
             startMining(p);
             msg(p, "Huỷ: " + why);
         }
@@ -517,6 +604,11 @@ public class AutoSandOrders implements ClientModInitializer {
 
     static void swapHotbar(Minecraft mc, LocalPlayer p, int invIdx, int hotbar) {
         mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, menuSlot(invIdx), hotbar, ClickType.SWAP, p);
+    }
+
+    /** Vứt nguyên stack ở ô túi đồ invIdx ra ngoài (như Ctrl+Q). */
+    static void dropStack(Minecraft mc, LocalPlayer p, int invIdx) {
+        mc.gameMode.handleInventoryMouseClick(p.inventoryMenu.containerId, menuSlot(invIdx), 1, ClickType.THROW, p);
     }
 
     static void setSelected(LocalPlayer p, int slot) { p.getInventory().setSelectedSlot(slot); }
@@ -537,6 +629,25 @@ public class AutoSandOrders implements ClientModInitializer {
             if (st.is(item)) n += st.getCount();
         }
         return n;
+    }
+
+    /** Ô cát đầu tiên trên thanh công cụ (0-8); -1 nếu không có. */
+    static int hotbarSandSlot(LocalPlayer p) {
+        for (int i = 0; i < 9; i++) {
+            if (p.getInventory().getItem(i).is(Items.SAND)) return i;
+        }
+        return -1;
+    }
+
+    /** Số bình XP còn thiếu để thanh công cụ đầy: ô trống = 1 stack, ô bình chưa đủ stack = phần thiếu. */
+    static int hotbarMissing(LocalPlayer p) {
+        int need = 0;
+        for (int i = 0; i < 9; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            if (st.isEmpty()) need += 64;
+            else if (st.is(Items.EXPERIENCE_BOTTLE)) need += st.getMaxStackSize() - st.getCount();
+        }
+        return need;
     }
 
     /** Đầy = không còn ô trống và không còn stack cát nào chưa đủ 64. */
