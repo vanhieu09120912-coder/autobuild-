@@ -11,6 +11,7 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.InteractionHand;
@@ -21,11 +22,27 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.text.Normalizer;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /**
@@ -37,6 +54,11 @@ import java.util.function.Predicate;
  * 2) Xẻng gần hư -> bình XP vào ô 2 thanh công cụ, xẻng vào tay trái, tay phải ném bình -> xẻng về lại.
  * 3) Hết bình XP -> vứt cát đang nằm trên thanh công cụ -> /shop -> ô totem -> bình XP -> đặt 64 -> xác nhận,
  *    lặp lại cho tới khi thanh công cụ đầy bình XP.
+ * 4) Đói (thanh đói <= mức chỉnh trong GUI) -> dừng đào, cầm đồ ăn + giữ chuột phải tới khi no -> đào tiếp.
+ * 5) Hết đồ ăn -> /shop -> FOOD -> Cà Rốt Vàng -> đặt 64 -> xác nhận -> ăn.
+ * 6) Vứt mọi vật phẩm trong túi (không tính thanh công cụ) KHÔNG phải: cát, bình XP, xẻng, đồ ăn (xem keepItem()).
+ *
+ * Key:    cần key (ngày/tuần/tháng) mới bật được. /autosand hwid | key <key> | status  (xem License.java)
  *
  * Lệnh:  /autosand            mở bảng GUI tuỳ chỉnh
  *        /autosand toggle     bật / tắt nhanh
@@ -70,6 +92,12 @@ public class AutoSandOrders implements ClientModInitializer {
     static final int SHOP_BOTTLE_SLOT = 16; // SHOP -> GEAR: ô bình XP
     static final int BUY_SET64_SLOT = 17;   // "đặt thành 64"
     static final int BUY_CONFIRM_SLOT = 23; // "xác nhận"
+    static final int SHOP_FOOD_SLOT = 14;       // /shop: ô danh mục FOOD (dự phòng nếu không tìm thấy theo tên)
+    static final int SHOP_FOOD_ITEM_SLOT = 16;  // SHOP -> FOOD: ô Cà Rốt Vàng (dự phòng)
+    static final int EAT_TO = 18;           // ăn tới khi thanh đói >= mức này (tối đa 20)
+    static final int EAT_SLOT = 8;          // ô thanh công cụ dùng để cầm đồ ăn khi đồ ăn đang nằm trong túi
+    static final int JUNK_INTERVAL = 100;   // tick tối thiểu giữa 2 lần dọn rác (100 = 5 giây)
+    static final int JUNK_MAX_DROPS = 60;   // tối đa số stack vứt trong 1 lần dọn
     // =======================================================================
 
     // ===================== CẤU HÌNH (đổi bằng GUI, tự lưu) =====================
@@ -87,6 +115,11 @@ public class AutoSandOrders implements ClientModInitializer {
     static boolean autoMend = true;
     static boolean autoBuy = true;
     static int mendPct = 10;
+    static boolean autoEat = true;
+    static boolean autoBuyFood = true;
+    static boolean autoDrop = true;
+    static int eatBelow = 14;               // thanh đói (0-20) <= mức này thì ăn
+    static final int[] EAT_LEVELS = {8, 12, 14, 16};
     static String ORDER_COMMAND = "orders sand";
     static String SHOP_COMMAND = "shop";
     static final int[] PCTS = {5, 10, 20, 30};
@@ -95,7 +128,8 @@ public class AutoSandOrders implements ClientModInitializer {
     enum S {
         MINING, WAIT_ORDERS, WAIT_DELIVER, DEPOSIT, WAIT_CONFIRM, FINISH,
         MEND_PREP, MEND_THROW, MEND_RESTORE,
-        BUY_PREP, BUY_SHOP, BUY_GEAR, BUY_AMOUNT, BUY_CONFIRM, BUY_DONE
+        BUY_PREP, BUY_SHOP, BUY_GEAR, BUY_AMOUNT, BUY_CONFIRM, BUY_DONE,
+        EAT_PREP, EAT_USE, JUNK
     }
 
     static S state = S.MINING;
@@ -108,6 +142,10 @@ public class AutoSandOrders implements ClientModInitializer {
     static int buyRetry = 0, gone = 0;                           // thử lại khi bảng mua bị đóng
     static int orderTry = 0, orderSlot = -1, ordersWait = 0, sandBefore = 0; // thử lần lượt các đơn cát
     static boolean settle = false;
+    static int licTick = 0;
+    static boolean buyFood = false, foodWarn = false;            // đang mua đồ ăn (thay vì bình XP)
+    static int foodBuyFails = 0, junkCool = 0, junkStep = 0, junkDropped = 0, eatPrevSlot = -1;
+    static float eatXRot = Float.NaN, junkXRot = Float.NaN;
     static boolean shovelSwapped = false, needBuy = false;
     static float oldXRot = Float.NaN, dropXRot = Float.NaN;
 
@@ -115,6 +153,7 @@ public class AutoSandOrders implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         load();
+        License.init(FabricLoader.getInstance().getConfigDir());
         ClientTickEvents.END_CLIENT_TICK.register(AutoSandOrders::tick);
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
@@ -138,6 +177,24 @@ public class AutoSandOrders implements ClientModInitializer {
                             ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh orders: /" + ORDER_COMMAND));
                             return 1;
                         })))
+                .then(ClientCommandManager.literal("key")
+                    .then(ClientCommandManager.argument("key", StringArgumentType.greedyString())
+                        .executes(ctx -> {
+                            activateKey(Minecraft.getInstance(), StringArgumentType.getString(ctx, "key"));
+                            return 1;
+                        })))
+                .then(ClientCommandManager.literal("hwid")
+                    .executes(ctx -> {
+                        Minecraft.getInstance().keyboardHandler.setClipboard(License.hwid());
+                        ctx.getSource().sendFeedback(Component.literal("[AutoSand] HWID: " + License.hwid()
+                            + " (đã copy). Nhắn Zalo " + License.ZALO + " kèm HWID + loại key (ngày/tuần/tháng) để lấy key."));
+                        return 1;
+                    }))
+                .then(ClientCommandManager.literal("status")
+                    .executes(ctx -> {
+                        ctx.getSource().sendFeedback(Component.literal("[AutoSand] Key: " + License.status()));
+                        return 1;
+                    }))
                 .then(ClientCommandManager.literal("shop")
                     .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
                         .executes(ctx -> {
@@ -168,6 +225,10 @@ public class AutoSandOrders implements ClientModInitializer {
             autoMend = Boolean.parseBoolean(pr.getProperty("mend", "true"));
             autoBuy = Boolean.parseBoolean(pr.getProperty("buy", "true"));
             mendPct = Integer.parseInt(pr.getProperty("mendPct", "10"));
+            autoEat = Boolean.parseBoolean(pr.getProperty("eat", "true"));
+            autoBuyFood = Boolean.parseBoolean(pr.getProperty("buyFood", "true"));
+            autoDrop = Boolean.parseBoolean(pr.getProperty("drop", "true"));
+            eatBelow = Integer.parseInt(pr.getProperty("eatBelow", "14"));
             ORDER_COMMAND = pr.getProperty("orderCmd", ORDER_COMMAND);
             SHOP_COMMAND = pr.getProperty("shopCmd", SHOP_COMMAND);
         } catch (Exception ignored) { }
@@ -183,6 +244,10 @@ public class AutoSandOrders implements ClientModInitializer {
             pr.setProperty("mend", String.valueOf(autoMend));
             pr.setProperty("buy", String.valueOf(autoBuy));
             pr.setProperty("mendPct", String.valueOf(mendPct));
+            pr.setProperty("eat", String.valueOf(autoEat));
+            pr.setProperty("buyFood", String.valueOf(autoBuyFood));
+            pr.setProperty("drop", String.valueOf(autoDrop));
+            pr.setProperty("eatBelow", String.valueOf(eatBelow));
             pr.setProperty("orderCmd", ORDER_COMMAND);
             pr.setProperty("shopCmd", SHOP_COMMAND);
             try (var out = Files.newOutputStream(cfgFile())) { pr.store(out, "AutoSand"); }
@@ -193,6 +258,10 @@ public class AutoSandOrders implements ClientModInitializer {
     static void setEnabled(Minecraft mc, boolean on) {
         if (on == enabled) return;
         LocalPlayer p = mc.player;
+        if (on && !License.valid()) {                    // phải có key còn hạn mới bật được
+            if (p != null) needKeyMsg(p);
+            return;
+        }
         enabled = on;
         state = S.MINING;
         cooldown = 0;
@@ -205,6 +274,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     swapOffhand(mc, p, shovelFrom);
                     shovelSwapped = false;
                 }
+                restoreLook(mc, p);
                 stopMining(mc, p);
             }
             msg(p, on ? "BẬT" : "TẮT");
@@ -213,6 +283,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
     // ----------------------------- ĐIỀU KHIỂN ĐÀO -----------------------------
     static void startMining(LocalPlayer p) {
+        if (!License.valid()) return;
         if (useNuker) send(p, NUKER_ON);
         if (mode == Mode.BARITONE) send(p, BARITONE_MINE);
     }
@@ -226,6 +297,7 @@ public class AutoSandOrders implements ClientModInitializer {
     static void releaseKeys(Minecraft mc) {
         mc.options.keyAttack.setDown(false);
         mc.options.keyUp.setDown(false);
+        mc.options.keyUse.setDown(false);
     }
 
     // ----------------------------- TICK -----------------------------
@@ -240,15 +312,44 @@ public class AutoSandOrders implements ClientModInitializer {
         }
         if (!enabled) return;
 
+        License.poll();
+        if (++licTick >= 20) {                           // mỗi ~1 giây kiểm tra lại key
+            licTick = 0;
+            if (!License.valid()) {
+                msg(p, "Key hết hạn hoặc không hợp lệ -> đã tắt AutoSand.");
+                needKeyMsg(p);
+                setEnabled(mc, false);
+                return;
+            }
+        }
+
         if (state == S.MINING) {
             if (mc.screen != null) return;
             if (mode == Mode.KEYS) {
                 mc.options.keyAttack.setDown(true);
                 mc.options.keyUp.setDown(keysForward);
             }
+            if (junkCool > 0) junkCool--;
             if (wait > 0) { wait--; return; }
             if (cooldown > 0) { cooldown--; return; }
 
+            // 1) vứt đồ rác (không phải cát / bình XP / xẻng / đồ ăn)
+            if (autoDrop && junkCool <= 0 && junkSlot(p) >= 0) {
+                startJunk(mc, p);
+                return;
+            }
+            // 2) đói -> ăn; hết đồ ăn -> mua
+            if (autoEat && p.getFoodData().getFoodLevel() <= eatBelow) {
+                if (findFood(p) >= 0) { foodWarn = false; startEat(mc, p); return; }
+                if (autoBuyFood && emptySlot(p) >= 0) { startFoodBuy(mc, p); return; }
+                if (!foodWarn) {
+                    foodWarn = true;
+                    msg(p, autoBuyFood
+                        ? "Đói nhưng túi không còn ô trống để mua đồ ăn (giao cát trước)."
+                        : "Đói nhưng hết đồ ăn (tự mua đồ ăn đang tắt).");
+                }
+            }
+            // 3) giao cát / sửa xẻng
             if (autoDeliver && isFull(p) && countItem(p, Items.SAND) > 0) {
                 startDeliver(mc, p);
             } else if (autoMend && lowShovel(p) >= 0) {
@@ -260,7 +361,7 @@ public class AutoSandOrders implements ClientModInitializer {
         if (wait > 0) { wait--; return; }
         if (--timeout <= 0) {
             // Mua dở nhưng đã có bình XP (vd. hết tiền ở lần mua sau) -> cứ dùng số bình đang có
-            if (state == S.BUY_DONE && countItem(p, Items.EXPERIENCE_BOTTLE) > 0) {
+            if (state == S.BUY_DONE && boughtAny(p)) {
                 finishBuy(mc, p);
                 return;
             }
@@ -509,8 +610,14 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             case BUY_SHOP -> {
                 if (h == null || h.getRowCount() != 3 || !loaded(h)) return;
-                int i = find(h, st -> st.is(Items.TOTEM_OF_UNDYING), -1);
-                if (i < 0) i = SHOP_TOTEM_SLOT;
+                int i;
+                if (buyFood) {                               // danh mục FOOD
+                    i = find(h, st -> nameHas(st, "food"), -1);
+                    if (i < 0) i = SHOP_FOOD_SLOT;
+                } else {                                     // ô totem -> GEAR
+                    i = find(h, st -> st.is(Items.TOTEM_OF_UNDYING), -1);
+                    if (i < 0) i = SHOP_TOTEM_SLOT;
+                }
                 click(mc, p, h, i, ClickType.PICKUP);
                 lastSync = h.containerId;
                 state = S.BUY_GEAR;
@@ -519,8 +626,14 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             case BUY_GEAR -> {
                 if (h == null || h.containerId == lastSync || h.getRowCount() != 3 || !loaded(h)) return;
-                int i = find(h, st -> st.is(Items.EXPERIENCE_BOTTLE), -1);
-                if (i < 0) i = SHOP_BOTTLE_SLOT;
+                int i;
+                if (buyFood) {                               // SHOP -> FOOD: Cà Rốt Vàng
+                    i = find(h, st -> st.is(Items.GOLDEN_CARROT), -1);
+                    if (i < 0) i = SHOP_FOOD_ITEM_SLOT;
+                } else {
+                    i = find(h, st -> st.is(Items.EXPERIENCE_BOTTLE), -1);
+                    if (i < 0) i = SHOP_BOTTLE_SLOT;
+                }
                 click(mc, p, h, i, ClickType.PICKUP);
                 lastSync = h.containerId;
                 state = S.BUY_AMOUNT;
@@ -555,7 +668,7 @@ public class AutoSandOrders implements ClientModInitializer {
                     i = BUY_CONFIRM_SLOT;
                     msg(p, "Không thấy nút xác nhận theo tên, bấm ô " + i + ". Các ô: " + dump(h));
                 }
-                buyBefore = countItem(p, Items.EXPERIENCE_BOTTLE); // để biết hàng về chưa
+                buyBefore = boughtCount(p); // để biết hàng về chưa
                 click(mc, p, h, i, ClickType.PICKUP);
                 state = S.BUY_DONE;
                 timeout = 80;
@@ -563,7 +676,7 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             case BUY_DONE -> {
                 // chờ hàng về (quá hạn thì xử lý ở phần timeout phía trên)
-                if (countItem(p, Items.EXPERIENCE_BOTTLE) <= buyBefore) return;
+                if (boughtCount(p) <= buyBefore) return;
                 if (mc.screen != null) { p.closeContainer(); wait = 3; return; }
                 buyRound++;
                 buyRetry = 0;
@@ -576,6 +689,64 @@ public class AutoSandOrders implements ClientModInitializer {
                     return;
                 }
                 finishBuy(mc, p);
+            }
+
+            // ================= VỨT ĐỒ KHÔNG PHẢI CÁT =================
+            case JUNK -> {
+                if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
+                if (junkStep == 0) {
+                    junkXRot = p.getXRot();
+                    p.setXRot(0f);                       // nhìn ngang để đồ văng xa, không bị nhặt lại
+                    junkStep = 1;
+                    wait = 3;
+                    return;
+                }
+                int j = junkSlot(p);
+                if (j >= 0 && junkDropped < JUNK_MAX_DROPS) {
+                    dropStack(mc, p, j);
+                    junkDropped++;
+                    timeout = STEP_TIMEOUT;
+                    wait = 2;
+                    return;
+                }
+                if (!Float.isNaN(junkXRot)) { p.setXRot(junkXRot); junkXRot = Float.NaN; }
+                state = S.MINING;
+                junkCool = JUNK_INTERVAL;
+                cooldown = 10;
+                startMining(p);
+                msg(p, "Đã vứt " + junkDropped + " stack đồ không cần.");
+            }
+
+            // ================= ĂN KHI ĐÓI =================
+            case EAT_PREP -> {
+                if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
+                if (p.getFoodData().getFoodLevel() >= EAT_TO) { finishEat(mc, p, COOLDOWN_AFTER); return; }
+                int idx = findFood(p);
+                if (idx < 0) { msg(p, "Không có đồ ăn."); finishEat(mc, p, 600); return; }
+                eatPrevSlot = getSelected(p);
+                idx = toHotbar(mc, p, idx);
+                setSelected(p, idx);
+                eatXRot = p.getXRot();
+                p.setXRot(-90f);                         // nhìn lên trời để chuột phải không bấm trúng khối nào
+                state = S.EAT_USE;
+                timeout = STEP_TIMEOUT;
+                wait = 3;
+            }
+            case EAT_USE -> {
+                if (mc.screen != null) { p.closeContainer(); wait = 2; return; }
+                if (!p.isUsingItem() && p.getFoodData().getFoodLevel() >= EAT_TO) {
+                    finishEat(mc, p, COOLDOWN_AFTER);
+                    return;
+                }
+                if (!edible(p.getMainHandItem())) {      // hết stack đang cầm -> cầm stack khác
+                    mc.options.keyUse.setDown(false);
+                    int idx = findFood(p);
+                    if (idx < 0) { msg(p, "Hết đồ ăn."); finishEat(mc, p, 0); return; }
+                    setSelected(p, toHotbar(mc, p, idx));
+                    wait = 3;
+                    return;
+                }
+                mc.options.keyUse.setDown(true);         // giữ chuột phải tới khi ăn xong
             }
 
             default -> { }
@@ -619,6 +790,53 @@ public class AutoSandOrders implements ClientModInitializer {
         return countItem(p, Items.SAND) < sandBefore;
     }
 
+    static void startJunk(Minecraft mc, LocalPlayer p) {
+        stopMining(mc, p);
+        state = S.JUNK;
+        junkStep = 0;
+        junkDropped = 0;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
+    }
+
+    static void startEat(Minecraft mc, LocalPlayer p) {
+        stopMining(mc, p);
+        state = S.EAT_PREP;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
+    }
+
+    /** Hết đồ ăn: /shop -> FOOD -> Cà Rốt Vàng -> 64 -> xác nhận (dùng lại các bước BUY_*), rồi ăn. */
+    static void startFoodBuy(Minecraft mc, LocalPlayer p) {
+        stopMining(mc, p);
+        msg(p, "Hết đồ ăn, đi mua thêm.");
+        buyFood = true;
+        buyRound = 0;
+        buyTarget = 1;
+        buyRetry = 0;
+        gone = 0;
+        send(p, "/" + SHOP_COMMAND);
+        state = S.BUY_SHOP;
+        timeout = STEP_TIMEOUT;
+        wait = ACTION_DELAY;
+    }
+
+    static void finishEat(Minecraft mc, LocalPlayer p, int cool) {
+        restoreLook(mc, p);
+        state = S.MINING;
+        cooldown = cool;
+        startMining(p);
+    }
+
+    /** Trả lại hướng nhìn / ô đang cầm / nhả chuột phải sau khi ăn hoặc vứt đồ. */
+    static void restoreLook(Minecraft mc, LocalPlayer p) {
+        mc.options.keyUse.setDown(false);
+        if (!Float.isNaN(eatXRot)) { p.setXRot(eatXRot); eatXRot = Float.NaN; }
+        if (!Float.isNaN(junkXRot)) { p.setXRot(junkXRot); junkXRot = Float.NaN; }
+        if (eatPrevSlot >= 0 && eatPrevSlot < 9) setSelected(p, eatPrevSlot);
+        eatPrevSlot = -1;
+    }
+
     static void startMend(Minecraft mc, LocalPlayer p) {
         if (countItem(p, Items.EXPERIENCE_BOTTLE) == 0 && !autoBuy) {
             msg(p, "Xẻng gần hư nhưng hết bình XP (tự mua đang tắt).");
@@ -641,6 +859,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
     /** Vào quy trình mua: vứt cát trên thanh công cụ -> /shop -> mua tới khi đầy thanh công cụ. */
     static void beginBuy() {
+        buyFood = false;
         dropStep = 0;
         buyRound = 0;
         buyRetry = 0;
@@ -664,6 +883,16 @@ public class AutoSandOrders implements ClientModInitializer {
     /** Mua xong -> quay lại sửa xẻng. */
     static void finishBuy(Minecraft mc, LocalPlayer p) {
         if (mc.screen != null) p.closeContainer();
+        if (buyFood) {                                   // mua đồ ăn xong -> ăn luôn
+            buyFood = false;
+            foodBuyFails = 0;
+            foodWarn = false;
+            msg(p, "Đã mua đồ ăn, hiện có " + countFood(p) + ".");
+            state = S.EAT_PREP;
+            timeout = STEP_TIMEOUT;
+            wait = ACTION_DELAY;
+            return;
+        }
         msg(p, "Đã mua bình XP, hiện có " + countItem(p, Items.EXPERIENCE_BOTTLE) + " bình.");
         state = S.MEND_PREP;
         step = 0;
@@ -692,9 +921,16 @@ public class AutoSandOrders implements ClientModInitializer {
             }
             if (!Float.isNaN(oldXRot)) { p.setXRot(oldXRot); oldXRot = Float.NaN; }
             if (!Float.isNaN(dropXRot)) { p.setXRot(dropXRot); dropXRot = Float.NaN; }
+            restoreLook(mc, p);
             startMining(p);
             msg(p, "Huỷ: " + why);
+            if (buyFood && ++foodBuyFails >= 3) {            // mua đồ ăn thất bại 3 lần liên tiếp -> tắt tự mua
+                autoBuyFood = false;
+                save();
+                msg(p, "Mua đồ ăn lỗi 3 lần, đã tắt tự mua đồ ăn. Kiểm tra lại ô /shop -> FOOD.");
+            }
         }
+        buyFood = false;
         state = S.MINING;
         cooldown = 200;
     }
@@ -734,6 +970,79 @@ public class AutoSandOrders implements ClientModInitializer {
             if (st.is(item)) n += st.getCount();
         }
         return n;
+    }
+
+    /** Vật phẩm được GIỮ trong túi: cát, bình XP, xẻng, đồ ăn. Muốn giữ thêm món nào thì thêm vào đây. */
+    static boolean keepItem(ItemStack st) {
+        return st.is(Items.SAND)
+            || st.is(Items.EXPERIENCE_BOTTLE)
+            || st.is(ItemTags.SHOVELS)
+            || st.has(DataComponents.FOOD);
+    }
+
+    /** Ô (9-35) đầu tiên chứa đồ cần vứt; -1 nếu không có. Không đụng thanh công cụ (0-8), giáp và tay trái. */
+    static int junkSlot(LocalPlayer p) {
+        for (int i = 9; i < 36; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            if (!st.isEmpty() && !keepItem(st)) return i;
+        }
+        return -1;
+    }
+
+    /** Đồ ăn dùng được để ăn lấp đói (bỏ qua đồ có hiệu ứng xấu và táo vàng). */
+    static boolean edible(ItemStack st) {
+        if (st.isEmpty() || !st.has(DataComponents.FOOD)) return false;
+        return !(st.is(Items.ROTTEN_FLESH) || st.is(Items.SPIDER_EYE) || st.is(Items.POISONOUS_POTATO)
+            || st.is(Items.PUFFERFISH) || st.is(Items.GOLDEN_APPLE) || st.is(Items.ENCHANTED_GOLDEN_APPLE)
+            || st.is(Items.CHORUS_FRUIT) || st.is(Items.SUSPICIOUS_STEW));
+    }
+
+    /** Ưu tiên cà rốt vàng, không có thì món ăn khác; -1 nếu hết đồ ăn. */
+    static int findFood(LocalPlayer p) {
+        int any = -1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            if (!edible(st)) continue;
+            if (st.is(Items.GOLDEN_CARROT)) return i;
+            if (any < 0) any = i;
+        }
+        return any;
+    }
+
+    static int countFood(LocalPlayer p) {
+        int n = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack st = p.getInventory().getItem(i);
+            if (edible(st)) n += st.getCount();
+        }
+        return n;
+    }
+
+    /** Số hàng đang mua (đồ ăn hoặc bình XP) để biết hàng đã về chưa. */
+    static int boughtCount(LocalPlayer p) {
+        return buyFood ? countFood(p) : countItem(p, Items.EXPERIENCE_BOTTLE);
+    }
+
+    static boolean boughtAny(LocalPlayer p) {
+        return boughtCount(p) > 0;
+    }
+
+    static int emptySlot(LocalPlayer p) {
+        for (int i = 0; i < 36; i++) {
+            if (p.getInventory().getItem(i).isEmpty()) return i;
+        }
+        return -1;
+    }
+
+    /** Đưa món ở ô túi idx lên thanh công cụ (nếu đang ở trong túi); trả về ô thanh công cụ (0-8). */
+    static int toHotbar(Minecraft mc, LocalPlayer p, int idx) {
+        if (idx < 9) return idx;
+        int target = EAT_SLOT;
+        for (int i = 0; i < 9; i++) {
+            if (p.getInventory().getItem(i).isEmpty()) { target = i; break; }
+        }
+        swapHotbar(mc, p, idx, target);
+        return target;
     }
 
     /** Ô cát đầu tiên trên thanh công cụ (0-8); -1 nếu không có. */
@@ -860,8 +1169,261 @@ public class AutoSandOrders implements ClientModInitializer {
         else p.connection.sendChat(s);
     }
 
+    static void activateKey(Minecraft mc, String key) {
+        if (mc.player != null) msg(mc.player, "Đang kiểm tra key...");
+        License.activateAsync(key, r -> mc.execute(() -> { if (mc.player != null) msg(mc.player, r); }));
+    }
+
+    static void needKeyMsg(LocalPlayer p) {
+        msg(p, "Cần key để dùng. Nhắn Zalo " + License.ZALO + " kèm HWID: " + License.hwid()
+            + " và loại key (ngày/tuần/tháng). Có key thì gõ /autosand key <key>.");
+    }
+
     static void msg(LocalPlayer p, String t) {
         p.displayClientMessage(Component.literal("[AutoSand] " + t), false);
+    }
+
+    // ============================== HỆ THỐNG KEY (LICENSE) ==============================
+    /**
+     * Hệ thống key cho AutoSand (chỉ dùng JDK, không phụ thuộc Minecraft).
+     *
+     * - Key do CHỦ tool tạo bằng KeyGen (giữ private key ở máy bạn, KHÔNG đưa vào mod).
+     * - Mỗi key được ký Ed25519 và GẮN VỚI 1 MÁY (HWID) + THỜI HẠN TUYỆT ĐỐI (ngày / tuần / tháng).
+     *   -> Không thể làm giả key, không dùng chung cho máy khác, hết hạn là chết hẳn, không dùng lại được.
+     * - Giờ được lấy từ Internet (header Date của HTTPS) + đồng hồ nanoTime (không bị chỉnh được) để chống lùi giờ máy.
+     */
+    static final class License {
+        private License() { }
+
+        public static final String ZALO = "0397657250";
+
+        /** Dán public key (do `java KeyGen.java genpair` in ra) vào đây. */
+        private static final String PUBLIC_KEY_B64 = "PASTE_PUBLIC_KEY_HERE";
+
+        private static final byte[] DOMAIN = "AutoSand/key/v1".getBytes(StandardCharsets.UTF_8);
+        private static final int PAYLOAD_LEN = 22;   // ver(1) type(1) issued(4) expires(4) hwid(8) id(4)
+        private static final int SIG_LEN = 64;
+        private static final String[] TYPE_NAME = {"?", "Ngày", "Tuần", "Tháng"};
+        private static final long RESYNC_NANOS = 10L * 60 * 1_000_000_000L;
+
+        private record Info(int type, long issued, long expires, byte[] hw) { }
+
+        private static Path file;
+        private static volatile String storedKey = null;
+        private static volatile long lastSeen = 0;          // mốc giờ lớn nhất đã thấy (chống lùi đồng hồ khi offline)
+        private static volatile long[] clock = null;        // {giây online, nanoTime lúc đồng bộ}
+        private static volatile boolean syncing = false;
+        private static volatile long nextSyncAt = System.nanoTime();
+        private static volatile long lastSaved = 0;
+        private static volatile String hwidCache = null;
+
+        // ----------------------------- KHỞI TẠO / LƯU -----------------------------
+        public static void init(Path configDir) {
+            file = configDir.resolve("autosand.lic");
+            try {
+                if (Files.exists(file)) {
+                    List<String> l = Files.readAllLines(file, StandardCharsets.UTF_8);
+                    if (!l.isEmpty()) storedKey = l.get(0).trim();
+                    if (l.size() > 1) lastSeen = Long.parseLong(l.get(1).trim());
+                }
+            } catch (Exception ignored) { }
+            poll();
+        }
+
+        private static void save() {
+            try {
+                if (file == null) return;
+                String k = storedKey == null ? "" : storedKey;
+                Files.write(file, List.of(k, String.valueOf(lastSeen)), StandardCharsets.UTF_8);
+            } catch (Exception ignored) { }
+        }
+
+        // ----------------------------- THỜI GIAN TIN CẬY -----------------------------
+        private static long now() {
+            long[] c = clock;
+            long t;
+            if (c != null) t = c[0] + (System.nanoTime() - c[1]) / 1_000_000_000L;
+            else t = Math.max(System.currentTimeMillis() / 1000, lastSeen);
+            if (t > lastSeen) {
+                lastSeen = t;
+                if (t - lastSaved >= 60) { lastSaved = t; save(); }
+            }
+            return t;
+        }
+
+        private static boolean syncTime() {
+            String[] urls = {"https://www.google.com", "https://www.cloudflare.com", "https://www.microsoft.com"};
+            for (String u : urls) {
+                try {
+                    HttpURLConnection c = (HttpURLConnection) URI.create(u).toURL().openConnection();
+                    c.setRequestMethod("HEAD");
+                    c.setConnectTimeout(4000);
+                    c.setReadTimeout(4000);
+                    c.setInstanceFollowRedirects(false);
+                    long d = c.getDate();
+                    c.disconnect();
+                    if (d > 0) {
+                        clock = new long[]{d / 1000, System.nanoTime()};
+                        return true;
+                    }
+                } catch (Exception ignored) { }
+            }
+            return false;
+        }
+
+        /** Gọi mỗi tick: tự đồng bộ giờ ngầm mỗi 10 phút. */
+        public static void poll() {
+            if (syncing || System.nanoTime() - nextSyncAt < 0) return;
+            syncing = true;
+            Thread t = new Thread(() -> {
+                try { syncTime(); } finally {
+                    nextSyncAt = System.nanoTime() + RESYNC_NANOS;
+                    syncing = false;
+                }
+            }, "autosand-time");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        // ----------------------------- HWID -----------------------------
+        public static String hwid() {
+            String c = hwidCache;
+            if (c != null) return c;
+            StringBuilder s = new StringBuilder("AutoSand-HW-v1");
+            s.append('|').append(System.getProperty("os.name")).append('|').append(System.getProperty("os.arch"));
+            s.append('|').append(System.getProperty("user.name"));
+            try { s.append('|').append(InetAddress.getLocalHost().getHostName()); } catch (Exception ignored) { }
+            String mac = "";
+            try {
+                for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                    byte[] m = ni.getHardwareAddress();
+                    if (m == null || m.length != 6 || ni.isLoopback() || ni.isVirtual()) continue;
+                    String n = (ni.getDisplayName() + ni.getName()).toLowerCase();
+                    if (n.contains("vmware") || n.contains("virtual") || n.contains("vbox") || n.contains("vethernet")
+                        || n.contains("hyper-v") || n.contains("tap") || n.contains("tun") || n.contains("docker")) continue;
+                    StringBuilder h = new StringBuilder();
+                    for (byte x : m) h.append(String.format("%02x", x));
+                    if (mac.isEmpty() || h.toString().compareTo(mac) < 0) mac = h.toString();
+                }
+            } catch (Exception ignored) { }
+            s.append('|').append(mac);
+            byte[] d = sha256(s.toString().getBytes(StandardCharsets.UTF_8));
+            StringBuilder r = new StringBuilder();
+            for (int i = 0; i < 8; i++) {
+                if (i > 0 && i % 2 == 0) r.append('-');
+                r.append(String.format("%02X", d[i]));
+            }
+            return hwidCache = r.toString();
+        }
+
+        private static byte[] hwBytes() {
+            String h = hwid().replace("-", "");
+            byte[] b = new byte[8];
+            for (int i = 0; i < 8; i++) b[i] = (byte) Integer.parseInt(h.substring(i * 2, i * 2 + 2), 16);
+            return b;
+        }
+
+        private static byte[] sha256(byte[] in) {
+            try { return MessageDigest.getInstance("SHA-256").digest(in); }
+            catch (Exception e) { throw new IllegalStateException(e); }
+        }
+
+        // ----------------------------- KIỂM TRA KEY -----------------------------
+        private static boolean verify(byte[] payload, byte[] sig) {
+            try {
+                PublicKey pk = KeyFactory.getInstance("Ed25519")
+                    .generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(PUBLIC_KEY_B64)));
+                Signature s = Signature.getInstance("Ed25519");
+                s.initVerify(pk);
+                s.update(DOMAIN);
+                s.update(payload);
+                return s.verify(sig);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        private static Info parse(String key) {
+            if (PUBLIC_KEY_B64.startsWith("PASTE")) throw new IllegalArgumentException("Mod chưa được cấu hình public key.");
+            byte[] raw;
+            try { raw = Base64.getUrlDecoder().decode(key.trim()); }
+            catch (Exception e) { throw new IllegalArgumentException("Key sai định dạng."); }
+            if (raw.length != PAYLOAD_LEN + SIG_LEN) throw new IllegalArgumentException("Key sai định dạng.");
+            byte[] payload = Arrays.copyOfRange(raw, 0, PAYLOAD_LEN);
+            byte[] sig = Arrays.copyOfRange(raw, PAYLOAD_LEN, raw.length);
+            if (!verify(payload, sig)) throw new IllegalArgumentException("Key không hợp lệ.");
+            ByteBuffer b = ByteBuffer.wrap(payload);
+            int ver = b.get() & 0xff;
+            int type = b.get() & 0xff;
+            long issued = b.getInt() & 0xffffffffL;
+            long expires = b.getInt() & 0xffffffffL;
+            byte[] hw = new byte[8];
+            b.get(hw);
+            if (ver != 1 || type < 1 || type > 3) throw new IllegalArgumentException("Key không hợp lệ.");
+            return new Info(type, issued, expires, hw);
+        }
+
+        private static boolean forThisMachine(Info i) {
+            return MessageDigest.isEqual(i.hw(), hwBytes());
+        }
+
+        /** Key đang lưu còn hợp lệ không (đúng chữ ký, đúng máy, chưa hết hạn). */
+        public static boolean valid() {
+            String k = storedKey;
+            if (k == null || k.isEmpty()) return false;
+            try {
+                Info i = parse(k);
+                return forThisMachine(i) && now() < i.expires() && now() >= i.issued() - 300;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        public static String status() {
+            String k = storedKey;
+            if (k == null || k.isEmpty()) return "chưa kích hoạt";
+            try {
+                Info i = parse(k);
+                if (!forThisMachine(i)) return "key không đúng máy";
+                long left = i.expires() - now();
+                if (left <= 0) return "key " + TYPE_NAME[i.type()] + " đã hết hạn";
+                return "key " + TYPE_NAME[i.type()] + ", còn " + fmt(left);
+            } catch (Exception e) {
+                return "key không hợp lệ";
+            }
+        }
+
+        private static String fmt(long sec) {
+            return (sec / 86400) + "d " + (sec % 86400 / 3600) + "h " + (sec % 3600 / 60) + "m";
+        }
+
+        // ----------------------------- KÍCH HOẠT -----------------------------
+        /** Kích hoạt trong luồng nền (không làm đơ game); cb nhận thông báo kết quả (gọi từ luồng nền). */
+        public static void activateAsync(String key, Consumer<String> cb) {
+            Thread t = new Thread(() -> {
+                String r;
+                try { r = activate(key); } catch (Throwable e) { r = "Lỗi kích hoạt: " + e.getMessage(); }
+                cb.accept(r);
+            }, "autosand-lic");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private static String activate(String key) {
+            key = key == null ? "" : key.replaceAll("\\s+", "");
+            Info i;
+            try { i = parse(key); } catch (IllegalArgumentException e) { return e.getMessage(); }
+            if (!forThisMachine(i)) {
+                return "Key này không dành cho máy này (HWID không khớp). Nhắn Zalo " + ZALO + " để lấy key đúng máy.";
+            }
+            if (!syncTime()) return "Cần kết nối Internet để kích hoạt key.";
+            if (now() >= i.expires()) {
+                return "Key đã hết hạn / đã dùng, không thể dùng lại. Nhắn Zalo " + ZALO + " để lấy key mới.";
+            }
+            storedKey = key;
+            save();
+            return "Kích hoạt thành công: key " + TYPE_NAME[i.type()] + ", còn " + fmt(i.expires() - now()) + ".";
+        }
     }
 
     // ============================== GUI TUỲ CHỈNH ==============================
@@ -877,14 +1439,35 @@ public class AutoSandOrders implements ClientModInitializer {
 
         @Override
         protected void init() {
-            int w = 230, h = 18, gap = 21;
+            int w = 230, count = 18;
+            int gap = Math.max(14, Math.min(21, (this.height - 12) / count));
+            int h = gap - 3;
             int x = this.width / 2 - w / 2;
-            int y = Math.max(6, this.height / 2 - (gap * 11) / 2);
+            int y = Math.max(6, this.height / 2 - (gap * count) / 2);
 
             Button head = Button.builder(Component.literal("=== AutoSand ==="), b -> { })
                 .bounds(x, y, w, h).build();
             head.active = false;
             addRenderableWidget(head);
+            y += gap;
+
+            Button st = Button.builder(Component.literal("Key: " + License.status()), b -> { })
+                .bounds(x, y, w, h).build();
+            st.active = false;
+            addRenderableWidget(st);
+            y += gap;
+
+            addRenderableWidget(Button.builder(Component.literal("Copy HWID (gửi Zalo " + License.ZALO + ")"), b -> {
+                Minecraft mc = Minecraft.getInstance();
+                mc.keyboardHandler.setClipboard(License.hwid());
+                if (mc.player != null) msg(mc.player, "Đã copy HWID: " + License.hwid());
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(Component.literal("Kích hoạt key từ clipboard"), b -> {
+                Minecraft mc = Minecraft.getInstance();
+                activateKey(mc, mc.keyboardHandler.getClipboard());
+            }).bounds(x, y, w, h).build());
             y += gap;
 
             addRenderableWidget(Button.builder(onOff("AutoSand", enabled), b -> {
@@ -951,6 +1534,39 @@ public class AutoSandOrders implements ClientModInitializer {
                 autoBuy = !autoBuy;
                 save();
                 b.setMessage(onOff("Tự mua bình XP", autoBuy));
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(onOff("Tự ăn khi đói", autoEat), b -> {
+                autoEat = !autoEat;
+                save();
+                b.setMessage(onOff("Tự ăn khi đói", autoEat));
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(Component.literal("Ăn khi thanh đói <= " + eatBelow + "/20"), b -> {
+                int next = EAT_LEVELS[0];
+                for (int v : EAT_LEVELS) {
+                    if (v > eatBelow) { next = v; break; }
+                }
+                eatBelow = next;
+                save();
+                b.setMessage(Component.literal("Ăn khi thanh đói <= " + eatBelow + "/20"));
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(onOff("Tự mua đồ ăn khi hết", autoBuyFood), b -> {
+                autoBuyFood = !autoBuyFood;
+                foodBuyFails = 0;
+                save();
+                b.setMessage(onOff("Tự mua đồ ăn khi hết", autoBuyFood));
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(onOff("Vứt đồ không phải cát", autoDrop), b -> {
+                autoDrop = !autoDrop;
+                save();
+                b.setMessage(onOff("Vứt đồ không phải cát", autoDrop));
             }).bounds(x, y, w, h).build());
             y += gap;
 
