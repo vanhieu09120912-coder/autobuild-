@@ -22,11 +22,27 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyFactory;
+import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.Signature;
+import java.security.spec.X509EncodedKeySpec;
 import java.text.Normalizer;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /**
@@ -41,6 +57,8 @@ import java.util.function.Predicate;
  * 4) Đói (thanh đói <= mức chỉnh trong GUI) -> dừng đào, cầm đồ ăn + giữ chuột phải tới khi no -> đào tiếp.
  * 5) Hết đồ ăn -> /shop -> FOOD -> Cà Rốt Vàng -> đặt 64 -> xác nhận -> ăn.
  * 6) Vứt mọi vật phẩm trong túi (không tính thanh công cụ) KHÔNG phải: cát, bình XP, xẻng, đồ ăn (xem keepItem()).
+ *
+ * Key:    cần key (ngày/tuần/tháng) mới bật được. /autosand hwid | key <key> | status  (xem License.java)
  *
  * Lệnh:  /autosand            mở bảng GUI tuỳ chỉnh
  *        /autosand toggle     bật / tắt nhanh
@@ -124,6 +142,7 @@ public class AutoSandOrders implements ClientModInitializer {
     static int buyRetry = 0, gone = 0;                           // thử lại khi bảng mua bị đóng
     static int orderTry = 0, orderSlot = -1, ordersWait = 0, sandBefore = 0; // thử lần lượt các đơn cát
     static boolean settle = false;
+    static int licTick = 0;
     static boolean buyFood = false, foodWarn = false;            // đang mua đồ ăn (thay vì bình XP)
     static int foodBuyFails = 0, junkCool = 0, junkStep = 0, junkDropped = 0, eatPrevSlot = -1;
     static float eatXRot = Float.NaN, junkXRot = Float.NaN;
@@ -134,6 +153,7 @@ public class AutoSandOrders implements ClientModInitializer {
     @Override
     public void onInitializeClient() {
         load();
+        License.init(FabricLoader.getInstance().getConfigDir());
         ClientTickEvents.END_CLIENT_TICK.register(AutoSandOrders::tick);
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
@@ -157,6 +177,24 @@ public class AutoSandOrders implements ClientModInitializer {
                             ctx.getSource().sendFeedback(Component.literal("[AutoSand] Lệnh orders: /" + ORDER_COMMAND));
                             return 1;
                         })))
+                .then(ClientCommandManager.literal("key")
+                    .then(ClientCommandManager.argument("key", StringArgumentType.greedyString())
+                        .executes(ctx -> {
+                            activateKey(Minecraft.getInstance(), StringArgumentType.getString(ctx, "key"));
+                            return 1;
+                        })))
+                .then(ClientCommandManager.literal("hwid")
+                    .executes(ctx -> {
+                        Minecraft.getInstance().keyboardHandler.setClipboard(License.hwid());
+                        ctx.getSource().sendFeedback(Component.literal("[AutoSand] HWID: " + License.hwid()
+                            + " (đã copy). Nhắn Zalo " + License.ZALO + " kèm HWID + loại key (ngày/tuần/tháng) để lấy key."));
+                        return 1;
+                    }))
+                .then(ClientCommandManager.literal("status")
+                    .executes(ctx -> {
+                        ctx.getSource().sendFeedback(Component.literal("[AutoSand] Key: " + License.status()));
+                        return 1;
+                    }))
                 .then(ClientCommandManager.literal("shop")
                     .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
                         .executes(ctx -> {
@@ -220,6 +258,10 @@ public class AutoSandOrders implements ClientModInitializer {
     static void setEnabled(Minecraft mc, boolean on) {
         if (on == enabled) return;
         LocalPlayer p = mc.player;
+        if (on && !License.valid()) {                    // phải có key còn hạn mới bật được
+            if (p != null) needKeyMsg(p);
+            return;
+        }
         enabled = on;
         state = S.MINING;
         cooldown = 0;
@@ -241,6 +283,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
     // ----------------------------- ĐIỀU KHIỂN ĐÀO -----------------------------
     static void startMining(LocalPlayer p) {
+        if (!License.valid()) return;
         if (useNuker) send(p, NUKER_ON);
         if (mode == Mode.BARITONE) send(p, BARITONE_MINE);
     }
@@ -268,6 +311,17 @@ public class AutoSandOrders implements ClientModInitializer {
             return;
         }
         if (!enabled) return;
+
+        License.poll();
+        if (++licTick >= 20) {                           // mỗi ~1 giây kiểm tra lại key
+            licTick = 0;
+            if (!License.valid()) {
+                msg(p, "Key hết hạn hoặc không hợp lệ -> đã tắt AutoSand.");
+                needKeyMsg(p);
+                setEnabled(mc, false);
+                return;
+            }
+        }
 
         if (state == S.MINING) {
             if (mc.screen != null) return;
@@ -1115,8 +1169,261 @@ public class AutoSandOrders implements ClientModInitializer {
         else p.connection.sendChat(s);
     }
 
+    static void activateKey(Minecraft mc, String key) {
+        if (mc.player != null) msg(mc.player, "Đang kiểm tra key...");
+        License.activateAsync(key, r -> mc.execute(() -> { if (mc.player != null) msg(mc.player, r); }));
+    }
+
+    static void needKeyMsg(LocalPlayer p) {
+        msg(p, "Cần key để dùng. Nhắn Zalo " + License.ZALO + " kèm HWID: " + License.hwid()
+            + " và loại key (ngày/tuần/tháng). Có key thì gõ /autosand key <key>.");
+    }
+
     static void msg(LocalPlayer p, String t) {
         p.displayClientMessage(Component.literal("[AutoSand] " + t), false);
+    }
+
+    // ============================== HỆ THỐNG KEY (LICENSE) ==============================
+    /**
+     * Hệ thống key cho AutoSand (chỉ dùng JDK, không phụ thuộc Minecraft).
+     *
+     * - Key do CHỦ tool tạo bằng KeyGen (giữ private key ở máy bạn, KHÔNG đưa vào mod).
+     * - Mỗi key được ký Ed25519 và GẮN VỚI 1 MÁY (HWID) + THỜI HẠN TUYỆT ĐỐI (ngày / tuần / tháng).
+     *   -> Không thể làm giả key, không dùng chung cho máy khác, hết hạn là chết hẳn, không dùng lại được.
+     * - Giờ được lấy từ Internet (header Date của HTTPS) + đồng hồ nanoTime (không bị chỉnh được) để chống lùi giờ máy.
+     */
+    static final class License {
+        private License() { }
+
+        public static final String ZALO = "0397657250";
+
+        /** Dán public key (do `java KeyGen.java genpair` in ra) vào đây. */
+        private static final String PUBLIC_KEY_B64 = "PASTE_PUBLIC_KEY_HERE";
+
+        private static final byte[] DOMAIN = "AutoSand/key/v1".getBytes(StandardCharsets.UTF_8);
+        private static final int PAYLOAD_LEN = 22;   // ver(1) type(1) issued(4) expires(4) hwid(8) id(4)
+        private static final int SIG_LEN = 64;
+        private static final String[] TYPE_NAME = {"?", "Ngày", "Tuần", "Tháng"};
+        private static final long RESYNC_NANOS = 10L * 60 * 1_000_000_000L;
+
+        private record Info(int type, long issued, long expires, byte[] hw) { }
+
+        private static Path file;
+        private static volatile String storedKey = null;
+        private static volatile long lastSeen = 0;          // mốc giờ lớn nhất đã thấy (chống lùi đồng hồ khi offline)
+        private static volatile long[] clock = null;        // {giây online, nanoTime lúc đồng bộ}
+        private static volatile boolean syncing = false;
+        private static volatile long nextSyncAt = System.nanoTime();
+        private static volatile long lastSaved = 0;
+        private static volatile String hwidCache = null;
+
+        // ----------------------------- KHỞI TẠO / LƯU -----------------------------
+        public static void init(Path configDir) {
+            file = configDir.resolve("autosand.lic");
+            try {
+                if (Files.exists(file)) {
+                    List<String> l = Files.readAllLines(file, StandardCharsets.UTF_8);
+                    if (!l.isEmpty()) storedKey = l.get(0).trim();
+                    if (l.size() > 1) lastSeen = Long.parseLong(l.get(1).trim());
+                }
+            } catch (Exception ignored) { }
+            poll();
+        }
+
+        private static void save() {
+            try {
+                if (file == null) return;
+                String k = storedKey == null ? "" : storedKey;
+                Files.write(file, List.of(k, String.valueOf(lastSeen)), StandardCharsets.UTF_8);
+            } catch (Exception ignored) { }
+        }
+
+        // ----------------------------- THỜI GIAN TIN CẬY -----------------------------
+        private static long now() {
+            long[] c = clock;
+            long t;
+            if (c != null) t = c[0] + (System.nanoTime() - c[1]) / 1_000_000_000L;
+            else t = Math.max(System.currentTimeMillis() / 1000, lastSeen);
+            if (t > lastSeen) {
+                lastSeen = t;
+                if (t - lastSaved >= 60) { lastSaved = t; save(); }
+            }
+            return t;
+        }
+
+        private static boolean syncTime() {
+            String[] urls = {"https://www.google.com", "https://www.cloudflare.com", "https://www.microsoft.com"};
+            for (String u : urls) {
+                try {
+                    HttpURLConnection c = (HttpURLConnection) URI.create(u).toURL().openConnection();
+                    c.setRequestMethod("HEAD");
+                    c.setConnectTimeout(4000);
+                    c.setReadTimeout(4000);
+                    c.setInstanceFollowRedirects(false);
+                    long d = c.getDate();
+                    c.disconnect();
+                    if (d > 0) {
+                        clock = new long[]{d / 1000, System.nanoTime()};
+                        return true;
+                    }
+                } catch (Exception ignored) { }
+            }
+            return false;
+        }
+
+        /** Gọi mỗi tick: tự đồng bộ giờ ngầm mỗi 10 phút. */
+        public static void poll() {
+            if (syncing || System.nanoTime() - nextSyncAt < 0) return;
+            syncing = true;
+            Thread t = new Thread(() -> {
+                try { syncTime(); } finally {
+                    nextSyncAt = System.nanoTime() + RESYNC_NANOS;
+                    syncing = false;
+                }
+            }, "autosand-time");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        // ----------------------------- HWID -----------------------------
+        public static String hwid() {
+            String c = hwidCache;
+            if (c != null) return c;
+            StringBuilder s = new StringBuilder("AutoSand-HW-v1");
+            s.append('|').append(System.getProperty("os.name")).append('|').append(System.getProperty("os.arch"));
+            s.append('|').append(System.getProperty("user.name"));
+            try { s.append('|').append(InetAddress.getLocalHost().getHostName()); } catch (Exception ignored) { }
+            String mac = "";
+            try {
+                for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                    byte[] m = ni.getHardwareAddress();
+                    if (m == null || m.length != 6 || ni.isLoopback() || ni.isVirtual()) continue;
+                    String n = (ni.getDisplayName() + ni.getName()).toLowerCase();
+                    if (n.contains("vmware") || n.contains("virtual") || n.contains("vbox") || n.contains("vethernet")
+                        || n.contains("hyper-v") || n.contains("tap") || n.contains("tun") || n.contains("docker")) continue;
+                    StringBuilder h = new StringBuilder();
+                    for (byte x : m) h.append(String.format("%02x", x));
+                    if (mac.isEmpty() || h.toString().compareTo(mac) < 0) mac = h.toString();
+                }
+            } catch (Exception ignored) { }
+            s.append('|').append(mac);
+            byte[] d = sha256(s.toString().getBytes(StandardCharsets.UTF_8));
+            StringBuilder r = new StringBuilder();
+            for (int i = 0; i < 8; i++) {
+                if (i > 0 && i % 2 == 0) r.append('-');
+                r.append(String.format("%02X", d[i]));
+            }
+            return hwidCache = r.toString();
+        }
+
+        private static byte[] hwBytes() {
+            String h = hwid().replace("-", "");
+            byte[] b = new byte[8];
+            for (int i = 0; i < 8; i++) b[i] = (byte) Integer.parseInt(h.substring(i * 2, i * 2 + 2), 16);
+            return b;
+        }
+
+        private static byte[] sha256(byte[] in) {
+            try { return MessageDigest.getInstance("SHA-256").digest(in); }
+            catch (Exception e) { throw new IllegalStateException(e); }
+        }
+
+        // ----------------------------- KIỂM TRA KEY -----------------------------
+        private static boolean verify(byte[] payload, byte[] sig) {
+            try {
+                PublicKey pk = KeyFactory.getInstance("Ed25519")
+                    .generatePublic(new X509EncodedKeySpec(Base64.getDecoder().decode(PUBLIC_KEY_B64)));
+                Signature s = Signature.getInstance("Ed25519");
+                s.initVerify(pk);
+                s.update(DOMAIN);
+                s.update(payload);
+                return s.verify(sig);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        private static Info parse(String key) {
+            if (PUBLIC_KEY_B64.startsWith("PASTE")) throw new IllegalArgumentException("Mod chưa được cấu hình public key.");
+            byte[] raw;
+            try { raw = Base64.getUrlDecoder().decode(key.trim()); }
+            catch (Exception e) { throw new IllegalArgumentException("Key sai định dạng."); }
+            if (raw.length != PAYLOAD_LEN + SIG_LEN) throw new IllegalArgumentException("Key sai định dạng.");
+            byte[] payload = Arrays.copyOfRange(raw, 0, PAYLOAD_LEN);
+            byte[] sig = Arrays.copyOfRange(raw, PAYLOAD_LEN, raw.length);
+            if (!verify(payload, sig)) throw new IllegalArgumentException("Key không hợp lệ.");
+            ByteBuffer b = ByteBuffer.wrap(payload);
+            int ver = b.get() & 0xff;
+            int type = b.get() & 0xff;
+            long issued = b.getInt() & 0xffffffffL;
+            long expires = b.getInt() & 0xffffffffL;
+            byte[] hw = new byte[8];
+            b.get(hw);
+            if (ver != 1 || type < 1 || type > 3) throw new IllegalArgumentException("Key không hợp lệ.");
+            return new Info(type, issued, expires, hw);
+        }
+
+        private static boolean forThisMachine(Info i) {
+            return MessageDigest.isEqual(i.hw(), hwBytes());
+        }
+
+        /** Key đang lưu còn hợp lệ không (đúng chữ ký, đúng máy, chưa hết hạn). */
+        public static boolean valid() {
+            String k = storedKey;
+            if (k == null || k.isEmpty()) return false;
+            try {
+                Info i = parse(k);
+                return forThisMachine(i) && now() < i.expires() && now() >= i.issued() - 300;
+            } catch (Exception e) {
+                return false;
+            }
+        }
+
+        public static String status() {
+            String k = storedKey;
+            if (k == null || k.isEmpty()) return "chưa kích hoạt";
+            try {
+                Info i = parse(k);
+                if (!forThisMachine(i)) return "key không đúng máy";
+                long left = i.expires() - now();
+                if (left <= 0) return "key " + TYPE_NAME[i.type()] + " đã hết hạn";
+                return "key " + TYPE_NAME[i.type()] + ", còn " + fmt(left);
+            } catch (Exception e) {
+                return "key không hợp lệ";
+            }
+        }
+
+        private static String fmt(long sec) {
+            return (sec / 86400) + "d " + (sec % 86400 / 3600) + "h " + (sec % 3600 / 60) + "m";
+        }
+
+        // ----------------------------- KÍCH HOẠT -----------------------------
+        /** Kích hoạt trong luồng nền (không làm đơ game); cb nhận thông báo kết quả (gọi từ luồng nền). */
+        public static void activateAsync(String key, Consumer<String> cb) {
+            Thread t = new Thread(() -> {
+                String r;
+                try { r = activate(key); } catch (Throwable e) { r = "Lỗi kích hoạt: " + e.getMessage(); }
+                cb.accept(r);
+            }, "autosand-lic");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private static String activate(String key) {
+            key = key == null ? "" : key.replaceAll("\\s+", "");
+            Info i;
+            try { i = parse(key); } catch (IllegalArgumentException e) { return e.getMessage(); }
+            if (!forThisMachine(i)) {
+                return "Key này không dành cho máy này (HWID không khớp). Nhắn Zalo " + ZALO + " để lấy key đúng máy.";
+            }
+            if (!syncTime()) return "Cần kết nối Internet để kích hoạt key.";
+            if (now() >= i.expires()) {
+                return "Key đã hết hạn / đã dùng, không thể dùng lại. Nhắn Zalo " + ZALO + " để lấy key mới.";
+            }
+            storedKey = key;
+            save();
+            return "Kích hoạt thành công: key " + TYPE_NAME[i.type()] + ", còn " + fmt(i.expires() - now()) + ".";
+        }
     }
 
     // ============================== GUI TUỲ CHỈNH ==============================
@@ -1132,7 +1439,7 @@ public class AutoSandOrders implements ClientModInitializer {
 
         @Override
         protected void init() {
-            int w = 230, count = 15;
+            int w = 230, count = 18;
             int gap = Math.max(14, Math.min(21, (this.height - 12) / count));
             int h = gap - 3;
             int x = this.width / 2 - w / 2;
@@ -1142,6 +1449,25 @@ public class AutoSandOrders implements ClientModInitializer {
                 .bounds(x, y, w, h).build();
             head.active = false;
             addRenderableWidget(head);
+            y += gap;
+
+            Button st = Button.builder(Component.literal("Key: " + License.status()), b -> { })
+                .bounds(x, y, w, h).build();
+            st.active = false;
+            addRenderableWidget(st);
+            y += gap;
+
+            addRenderableWidget(Button.builder(Component.literal("Copy HWID (gửi Zalo " + License.ZALO + ")"), b -> {
+                Minecraft mc = Minecraft.getInstance();
+                mc.keyboardHandler.setClipboard(License.hwid());
+                if (mc.player != null) msg(mc.player, "Đã copy HWID: " + License.hwid());
+            }).bounds(x, y, w, h).build());
+            y += gap;
+
+            addRenderableWidget(Button.builder(Component.literal("Kích hoạt key từ clipboard"), b -> {
+                Minecraft mc = Minecraft.getInstance();
+                activateKey(mc, mc.keyboardHandler.getClipboard());
+            }).bounds(x, y, w, h).build());
             y += gap;
 
             addRenderableWidget(Button.builder(onOff("AutoSand", enabled), b -> {
